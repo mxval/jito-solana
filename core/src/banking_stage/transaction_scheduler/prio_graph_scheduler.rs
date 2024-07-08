@@ -8,7 +8,6 @@ use {
     },
     crate::banking_stage::{
         consumer::TARGET_NUM_TRANSACTIONS_PER_BATCH,
-        read_write_account_set::ReadWriteAccountSet,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork, TransactionBatchId, TransactionId},
         transaction_scheduler::transaction_priority_id::TransactionPriorityId,
     },
@@ -89,10 +88,7 @@ impl PrioGraphScheduler {
         let mut batches = Batches::new(num_threads);
         // Some transactions may be unschedulable due to multi-thread conflicts.
         // These transactions cannot be scheduled until some conflicting work is completed.
-        // However, the scheduler should not allow other transactions that conflict with
-        // these transactions to be scheduled before them.
         let mut unschedulable_ids = Vec::new();
-        let mut blocking_locks = ReadWriteAccountSet::default();
         let mut prio_graph = PrioGraph::new(|id: &TransactionPriorityId, _graph_node| *id);
 
         // Track metrics on filter.
@@ -178,14 +174,6 @@ impl PrioGraphScheduler {
                     continue;
                 }
 
-                // Check if this transaction conflicts with any blocked transactions
-                if !blocking_locks.check_locks(transaction.message()) {
-                    blocking_locks.take_locks(transaction.message());
-                    unschedulable_ids.push(id);
-                    saturating_add_assign!(num_unschedulable, 1);
-                    continue;
-                }
-
                 // Schedule the transaction if it can be.
                 let transaction_locks = transaction.get_account_locks_unchecked();
                 let Some(thread_id) = self.account_locks.try_lock_accounts(
@@ -202,7 +190,6 @@ impl PrioGraphScheduler {
                         )
                     },
                 ) else {
-                    blocking_locks.take_locks(transaction.message());
                     unschedulable_ids.push(id);
                     saturating_add_assign!(num_unschedulable, 1);
                     continue;
@@ -715,77 +702,6 @@ mod tests {
         assert_eq!(scheduling_summary.num_unschedulable, 0);
         assert_eq!(collect_work(&work_receivers[0]).1, [txids!([3, 1])]);
         assert_eq!(collect_work(&work_receivers[1]).1, [txids!([2, 0])]);
-    }
-
-    #[test]
-    fn test_schedule_priority_guard() {
-        let (mut scheduler, work_receivers, finished_work_sender) = create_test_frame(2);
-        // intentionally shorten the look-ahead window to cause unschedulable conflicts
-        scheduler.look_ahead_window_size = 2;
-
-        let accounts = (0..8).map(|_| Keypair::new()).collect_vec();
-        let mut container = create_container([
-            (&accounts[0], &[accounts[1].pubkey()], 1, 6),
-            (&accounts[2], &[accounts[3].pubkey()], 1, 5),
-            (&accounts[4], &[accounts[5].pubkey()], 1, 4),
-            (&accounts[6], &[accounts[7].pubkey()], 1, 3),
-            (&accounts[1], &[accounts[2].pubkey()], 1, 2),
-            (&accounts[2], &[accounts[3].pubkey()], 1, 1),
-        ]);
-
-        // The look-ahead window is intentionally shortened, high priority transactions
-        // [0, 1, 2, 3] do not conflict, and are scheduled onto threads in a
-        // round-robin fashion. This leads to transaction [4] being unschedulable due
-        // to conflicts with [0] and [1], which were scheduled to different threads.
-        // Transaction [5] is technically schedulable, onto thread 1 since it only
-        // conflicts with transaction [1]. However, [5] will not be scheduled because
-        // it conflicts with a higher-priority transaction [4] that is unschedulable.
-        // The full prio-graph can be visualized as:
-        // [0] \
-        //      -> [4] -> [5]
-        // [1] / ------/
-        // [2]
-        // [3]
-        // Because the look-ahead window is shortened to a size of 4, the scheduler does
-        // not have knowledge of the joining at transaction [4] until after [0] and [1]
-        // have been scheduled.
-        let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
-            .unwrap();
-        assert_eq!(scheduling_summary.num_scheduled, 4);
-        assert_eq!(scheduling_summary.num_unschedulable, 2);
-        let (thread_0_work, thread_0_ids) = collect_work(&work_receivers[0]);
-        assert_eq!(thread_0_ids, [txids!([0]), txids!([2])]);
-        assert_eq!(
-            collect_work(&work_receivers[1]).1,
-            [txids!([1]), txids!([3])]
-        );
-
-        // Cannot schedule even on next pass because of lock conflicts
-        let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
-            .unwrap();
-        assert_eq!(scheduling_summary.num_scheduled, 0);
-        assert_eq!(scheduling_summary.num_unschedulable, 2);
-
-        // Complete batch on thread 0. Remaining txs can be scheduled onto thread 1
-        finished_work_sender
-            .send(FinishedConsumeWork {
-                work: thread_0_work.into_iter().next().unwrap(),
-                retryable_indexes: vec![],
-            })
-            .unwrap();
-        scheduler.receive_completed(&mut container).unwrap();
-        let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
-            .unwrap();
-        assert_eq!(scheduling_summary.num_scheduled, 2);
-        assert_eq!(scheduling_summary.num_unschedulable, 0);
-
-        assert_eq!(
-            collect_work(&work_receivers[1]).1,
-            [txids!([4]), txids!([5])]
-        );
     }
 
     #[test]
